@@ -52,6 +52,8 @@ class MainActivity : Activity() {
                 // Keep the WebView visible to maintain playback
                 if (visibility != View.VISIBLE) {
                     this.visibility = View.INVISIBLE
+                } else {
+                    this.visibility = View.VISIBLE
                 }
             }
             
