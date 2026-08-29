@@ -9,31 +9,34 @@
   // ============================================================
 
   const POLL_INTERVAL = 400;          // full ad-state re-evaluation
-  const SKIP_POLL_INTERVAL = 150;     // dedicated fast loop just for clicking Skip
+  const SKIP_POLL_INTERVAL = 150;     // dedicated fast loop for clicking Skip
+  const SEEK_POLL_INTERVAL = 150;     // dedicated fast loop for seek-to-end attempts
   const VIDEO_ATTACH_INTERVAL = 1200;
 
   const AD_CONFIRM_DELAY = 250;
   const AD_END_GRACE = 800;
 
   const SKIP_CLICK_INTERVAL = 300;    // don't spam-click the same button
+  const SEEK_RETRY_INTERVAL = 400;    // re-attempt seek if ad UI is still up
+  const MAX_SEEK_ATTEMPTS = 5;        // give up on seeking after this many tries
 
-  // Fallback only, used when no Skip button exists (non-skippable ads).
-  // Kept modest — high rates make YouTube's ad -> main-video swap more
-  // likely to show a blank/black frame.
+  // Only used if seeking is blocked by the ad player AND no skip
+  // button ever appears. Kept modest — high rates make the ad ->
+  // main-video swap more likely to show a blank/black frame.
   const AD_PLAYBACK_RATE = 4;
-
-  // How long to wait for a Skip button to appear before we resort to
-  // fast-forwarding at all. Most skippable ads show the button within
-  // ~5s; we don't want to speed through that window and miss it.
-  const FASTFORWARD_DELAY = 1500;
+  const FASTFORWARD_DELAY = 3000; // give seek+skip a real chance first
 
   // Video is hidden (opacity 0) for this long max during the ad -> main
   // transition, then forced visible regardless, so a stuck detection
   // can't leave the screen blank forever.
   const TRANSITION_HIDE_MAX = 1200;
 
-  // Guard against double injection (e.g. WebView re-injects on every
-  // navigation without a full reload).
+  // How often we check "is the real video actually ready now?" while
+  // masked. This runs independently of the slower ad-state grace
+  // period so we reveal the instant content is really back, instead
+  // of staying hidden for the full AD_END_GRACE window.
+  const REVEAL_CHECK_INTERVAL = 80;
+
   if (window.__ytAdBlockerActive) {
     log('already running, skipping re-init');
     return;
@@ -78,8 +81,7 @@
       pointer-events: none !important;
     }
 
-    /* Used briefly during the ad -> main-video handoff to mask
-       the blank/black frame instead of leaving it visible. */
+    /* Masks the blank/black frame during the ad -> main-video handoff. */
     .yt-ad-blocker-hide-video {
       opacity: 0 !important;
       transition: opacity 120ms ease-out;
@@ -103,6 +105,8 @@
 
   let lastSkipClick = 0;
   let lastPlayAttempt = 0;
+  let lastSeekAttempt = 0;
+  let seekAttemptCount = 0;
 
   let originalPlaybackRate = 1;
 
@@ -114,6 +118,8 @@
 
   let pollIntervalId = null;
   let skipPollIntervalId = null;
+  let seekPollIntervalId = null;
+  let revealPollIntervalId = null;
   let attachIntervalId = null;
   let mutationObserver = null;
 
@@ -159,21 +165,17 @@
   }
 
   // ------------------------------------------------------------
-  // Transition hide/reveal — masks the blank frame while YouTube
-  // swaps the ad media out for the real video.
+  // Transition hide/reveal
   // ------------------------------------------------------------
 
   function hideDuringTransition(v) {
     if (!v) return;
-
     v.classList.add('yt-ad-blocker-hide-video');
 
     if (transitionRevealTimeoutId !== null) {
       clearTimeout(transitionRevealTimeoutId);
     }
 
-    // Safety net: never leave the video hidden longer than this,
-    // even if our "ready" check never fires.
     transitionRevealTimeoutId = setTimeout(() => {
       transitionRevealTimeoutId = null;
       revealVideo(getVideo());
@@ -186,6 +188,33 @@
       transitionRevealTimeoutId = null;
     }
     if (v) v.classList.remove('yt-ad-blocker-hide-video');
+  }
+
+  // ------------------------------------------------------------
+  // Fast, independent reveal check.
+  //
+  // hideDuringTransition() gets called the instant we *attempt* a
+  // skip (click/seek), which is before we can be sure the ad is
+  // actually gone. The official ad-gone detection (AD_END_GRACE)
+  // is intentionally conservative to avoid flicker, which means
+  // waiting for it to reveal the video would mask the screen far
+  // longer than the real transition takes.
+  //
+  // This loop runs independently, checking only "is a real video
+  // frame ready right now, with no ad UI showing" — as soon as
+  // that's true, reveal immediately, regardless of what the slower
+  // state machine has decided yet.
+  // ------------------------------------------------------------
+
+  function checkFastReveal() {
+    const v = getVideo();
+    if (!v) return;
+    if (!v.classList.contains('yt-ad-blocker-hide-video')) return;
+
+    if (!detectAdUI() && isVideoReady(v)) {
+      revealVideo(v);
+      log('fast reveal: real content ready');
+    }
   }
 
   // ============================================================
@@ -282,6 +311,7 @@
 
       clearPendingRestore();
       adStartedAt = performance.now();
+      seekAttemptCount = 0;
 
       const v = getVideo();
       if (v) {
@@ -297,6 +327,7 @@
 
       adCandidateSince = 0;
       adGoneSince = 0;
+      seekAttemptCount = 0;
 
       restoreVideoPlayback();
     }
@@ -310,11 +341,8 @@
     const v = getVideo();
     if (!v) return;
 
-    // Mask the swap so any blank/black frame isn't visible.
     hideDuringTransition(v);
 
-    // Reset rate immediately — do not carry fast-forward speed
-    // into the main video even for an instant.
     try {
       v.playbackRate = originalPlaybackRate > 0 ? originalPlaybackRate : 1;
     } catch (_) {}
@@ -324,8 +352,6 @@
     restoreTimeoutId = setTimeout(() => {
       restoreTimeoutId = null;
 
-      // A new ad started while we were waiting — leave it hidden/
-      // handled by the new ad cycle instead of revealing early.
       if (adActive) return;
 
       const currentVideo = getVideo();
@@ -333,8 +359,6 @@
 
       if (!isVideoReady(currentVideo)) {
         log('main video not ready yet, waiting a bit longer');
-        // Try again shortly rather than giving up — but the
-        // TRANSITION_HIDE_MAX safety net still guarantees reveal.
         restoreTimeoutId = setTimeout(() => {
           restoreTimeoutId = null;
           const v2 = getVideo();
@@ -455,11 +479,7 @@
   }
 
   // ============================================================
-  // Dedicated fast skip-click loop
-  //
-  // Runs much more often than the main state poll so the button
-  // gets clicked the instant it becomes clickable, instead of
-  // relying on fast-forward.
+  // Priority 1: click the real Skip button
   // ============================================================
 
   function trySkipClickOnly() {
@@ -472,6 +492,10 @@
     if (!skipButton) return;
 
     try {
+      // Mask proactively, right as we trigger the transition —
+      // don't wait for the slower ad-gone detection to catch up.
+      hideDuringTransition(getVideo());
+
       skipButton.click();
       lastSkipClick = now;
       log('clicked skip button');
@@ -479,7 +503,59 @@
   }
 
   // ============================================================
-  // Fallback: accelerate playback only if Skip never appears
+  // Priority 2: instant seek-to-end
+  //
+  // Jumping currentTime to (duration - epsilon) fires the video's
+  // native 'ended' event immediately. YouTube's player treats that
+  // exactly like the ad finishing on its own and advances straight
+  // to the real video — no sped-up playback, no visible fast-
+  // forward, and a much shorter window for the transition frame
+  // than ramping playbackRate ever gave us.
+  //
+  // This only works while the underlying <video> element still
+  // allows programmatic seeking, which is true for the vast
+  // majority of YouTube's ad player. A few ad types (live-style or
+  // server-stitched ads with duration = Infinity/NaN) can't be
+  // seeked this way — those fall through to the fast-forward
+  // fallback below.
+  // ============================================================
+
+  function trySeekSkip() {
+    if (!adActive) return;
+    if (seekAttemptCount >= MAX_SEEK_ATTEMPTS) return;
+
+    const v = getVideo();
+    if (!v) return;
+
+    if (!isFiniteDuration(v)) return; // can't jump to "the end" of Infinity/NaN
+
+    const now = performance.now();
+    if (now - lastSeekAttempt < SEEK_RETRY_INTERVAL) return;
+
+    if (v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
+    // Already essentially at the end — nothing to do, let the
+    // 'ended'/ad-UI-gone detection catch up.
+    if (v.duration - v.currentTime < 0.25) return;
+
+    try {
+      lastSeekAttempt = now;
+      seekAttemptCount += 1;
+
+      // Mask proactively — the seek is about to trigger YouTube's
+      // media swap, and that's what produces the blank frame.
+      hideDuringTransition(v);
+
+      v.currentTime = Math.max(0, v.duration - 0.05);
+      log('seek-skip attempt', seekAttemptCount, '-> jumped to end of ad');
+    } catch (_) {}
+  }
+
+  // ============================================================
+  // Priority 3 (last resort): accelerate playback
+  //
+  // Only reached if seeking is blocked AND no skip button ever
+  // shows up, and only after giving both a real chance first.
   // ============================================================
 
   function tryFastForwardFallback() {
@@ -490,16 +566,12 @@
 
     const now = performance.now();
 
-    // Give the Skip button a real chance to show up first.
     if (now - adStartedAt < FASTFORWARD_DELAY) return;
-
-    // If a skip button exists, don't fast-forward — let the
-    // dedicated click loop handle it instead. Avoids the visible
-    // speed-up on ads that are actually skippable.
-    if (findSkipButton()) return;
+    if (findSkipButton()) return;          // let the click loop handle it
+    if (isFiniteDuration(v)) return;       // let seek-skip handle it
 
     try {
-      if (isFiniteDuration(v) && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         v.playbackRate = AD_PLAYBACK_RATE;
       }
     } catch (_) {}
@@ -525,7 +597,8 @@
     'play',
     'playing',
     'pause',
-    'timeupdate'
+    'timeupdate',
+    'ended'
   ];
 
   function detachVideoEvents(v) {
@@ -604,6 +677,8 @@
   function teardown() {
     if (pollIntervalId !== null) clearInterval(pollIntervalId);
     if (skipPollIntervalId !== null) clearInterval(skipPollIntervalId);
+    if (seekPollIntervalId !== null) clearInterval(seekPollIntervalId);
+    if (revealPollIntervalId !== null) clearInterval(revealPollIntervalId);
     if (attachIntervalId !== null) clearInterval(attachIntervalId);
     if (mutationObserver) mutationObserver.disconnect();
     clearPendingRestore();
@@ -639,9 +714,9 @@
     tryFastForwardFallback();
   }, POLL_INTERVAL);
 
-  // Separate, faster loop dedicated purely to clicking Skip the
-  // moment it's available.
   skipPollIntervalId = setInterval(trySkipClickOnly, SKIP_POLL_INTERVAL);
+  seekPollIntervalId = setInterval(trySeekSkip, SEEK_POLL_INTERVAL);
+  revealPollIntervalId = setInterval(checkFastReveal, REVEAL_CHECK_INTERVAL);
 
   attachIntervalId = setInterval(() => {
     const v = getVideo();
@@ -658,5 +733,5 @@
   const initialVideo = getVideo();
   if (initialVideo) attachVideoEvents(initialVideo);
 
-  log('Mobile WebView ad handling ready (skip-priority mode)');
+  log('Mobile WebView ad handling ready (seek-skip priority mode)');
 })();

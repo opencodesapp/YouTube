@@ -19,6 +19,8 @@ import androidx.annotation.RequiresApi
 class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var container: FrameLayout
+    private var customView: View? = null
+    private var customViewCallback: WebChromeClient.CustomViewCallback? = null
     
     companion object {
         private const val TAG = "YouTubeActivity"
@@ -123,6 +125,48 @@ class MainActivity : Activity() {
                 }
             }
             
+            webChromeClient = object : WebChromeClient() {
+                override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                    super.onShowCustomView(view, callback)
+                    if (customView != null) {
+                        callback?.onCustomViewHidden()
+                        return
+                    }
+                    customView = view
+                    customViewCallback = callback
+                    
+                    // Hide WebView
+                    webView.visibility = View.GONE
+                    
+                    // Add Custom View (video)
+                    container.addView(customView, ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    ))
+                    
+                    // Rotate to Landscape
+                    requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
+
+                override fun onHideCustomView() {
+                    super.onHideCustomView()
+                    if (customView == null) return
+                    
+                    // Rotate back to user/portrait
+                    requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    
+                    // Remove custom view
+                    container.removeView(customView)
+                    customView = null
+                    
+                    // Show WebView
+                    webView.visibility = View.VISIBLE
+                    
+                    customViewCallback?.onCustomViewHidden()
+                    customViewCallback = null
+                }
+            }
+            
             // Load YouTube mobile site with desktop user agent for better features
             val userAgent = settings.userAgentString
             settings.userAgentString = userAgent?.replace("Mobile", "Desktop") ?: userAgent
@@ -187,7 +231,16 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (webView.canGoBack()) {
+        if (customView != null) {
+            // Exit fullscreen manually or through the callback
+            customViewCallback?.onCustomViewHidden()
+            // We should also trigger the hiding logic we placed in onHideCustomView
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            container.removeView(customView)
+            customView = null
+            webView.visibility = View.VISIBLE
+            customViewCallback = null
+        } else if (webView.canGoBack()) {
             webView.goBack()
         } else {
             super.onBackPressed()
